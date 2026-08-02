@@ -29,7 +29,25 @@ type Manifest struct {
 const (
 	manifestFieldWidth      = 16
 	conversunDistributorTag = "conversun"
+	allowedDistributorsEnv  = "ALLOWED_DISTRIBUTORS"
 )
+
+// allowedDistributors returns the set of distributor tags the store treats as
+// its own installed apps. conversun (upstream) is always allowed; custom forks
+// can extend the set via the ALLOWED_DISTRIBUTORS env var (comma-separated),
+// e.g. ALLOWED_DISTRIBUTORS=conversun,soleo so apps packaged with
+// distributor=soleo are recognized as installed.
+func allowedDistributors() map[string]bool {
+	allowed := map[string]bool{conversunDistributorTag: true}
+	if raw := os.Getenv(allowedDistributorsEnv); raw != "" {
+		for _, d := range strings.Split(raw, ",") {
+			if d = strings.TrimSpace(d); d != "" {
+				allowed[d] = true
+			}
+		}
+	}
+	return allowed
+}
 
 func ParseManifest(path string) (*Manifest, error) {
 	f, err := os.Open(path)
@@ -101,6 +119,8 @@ func ScanInstalled(appsDir string) ([]Manifest, error) {
 		return nil, fmt.Errorf("read apps dir %q: %w", appsDir, err)
 	}
 
+	allowed := allowedDistributors()
+
 	apps := make([]Manifest, 0, len(entries))
 	for _, entry := range entries {
 		if !entry.IsDir() {
@@ -116,7 +136,7 @@ func ScanInstalled(appsDir string) ([]Manifest, error) {
 			return nil, parseErr
 		}
 
-		if m.Distributor != conversunDistributorTag {
+		if !allowed[m.Distributor] {
 			continue
 		}
 
