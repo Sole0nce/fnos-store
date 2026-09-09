@@ -1,6 +1,8 @@
 package core
 
 import (
+	"archive/tar"
+	"compress/gzip"
 	"context"
 	"errors"
 	"fmt"
@@ -44,6 +46,13 @@ func NewDownloader(downloadDir string) *Downloader {
 	}
 }
 
+// staleTmpAge is how old a temp file must be before cleanup may reap it. A
+// younger file may belong to an in-flight download — deleting it out from
+// under os.Rename was conversun/fnos-apps#245.
+const staleTmpAge = time.Hour
+
+// CleanupStaleTmpFiles reaps ABANDONED download temp files (older than
+// staleTmpAge). It is safe to run while a download is in flight.
 func (d *Downloader) CleanupStaleTmpFiles() error {
 	entries, err := os.ReadDir(d.downloadDir)
 	if err != nil {
@@ -57,9 +66,17 @@ func (d *Downloader) CleanupStaleTmpFiles() error {
 		if entry.IsDir() {
 			continue
 		}
-		if strings.HasSuffix(entry.Name(), ".fpk.tmp") {
-			_ = os.Remove(filepath.Join(d.downloadDir, entry.Name()))
+		if !strings.HasSuffix(entry.Name(), ".fpk.tmp") {
+			continue
 		}
+		info, err := entry.Info()
+		if err != nil {
+			continue
+		}
+		if time.Since(info.ModTime()) < staleTmpAge {
+			continue
+		}
+		_ = os.Remove(filepath.Join(d.downloadDir, entry.Name()))
 	}
 	return nil
 }
@@ -79,7 +96,6 @@ func (d *Downloader) Download(ctx context.Context, req DownloadRequest, progress
 
 	prefixedName := req.AppName + "-" + req.FileName
 	finalPath := filepath.Join(d.downloadDir, prefixedName)
-	tmpPath := finalPath + ".tmp"
 
 	urls := req.URLs
 
@@ -89,6 +105,20 @@ func (d *Downloader) Download(ctx context.Context, req DownloadRequest, progress
 
 	var lastErr error
 	for _, url := range urls {
+		// A unique temp file per attempt: the deterministic finalPath+".tmp"
+		// let any second actor (OS /tmp reaper, stale cleanup, retry) delete
+		// the in-flight file under os.Rename (conversun/fnos-apps#245). The
+		// ".fpk.tmp" suffix is kept so CleanupStaleTmpFiles still matches.
+		tmp, err := os.CreateTemp(d.downloadDir, prefixedName+".*.fpk.tmp")
+		if err != nil {
+			return "", fmt.Errorf("create temp file: %w", err)
+		}
+		tmpPath := tmp.Name()
+		if err := tmp.Close(); err != nil {
+			_ = os.Remove(tmpPath)
+			return "", fmt.Errorf("close temp file: %w", err)
+		}
+
 		if err := d.downloadFromURL(ctx, url, tmpPath, progress); err != nil {
 			lastErr = err
 			_ = os.Remove(tmpPath)
@@ -156,11 +186,46 @@ func (d *Downloader) downloadFromURL(ctx context.Context, url, dstPath string, p
 		return err
 	}
 
-	const minFpkSize int64 = 10 * 1024
-	if downloaded < minFpkSize {
-		return fmt.Errorf("downloaded file too small (%d bytes) — likely corrupted", downloaded)
+	if err := validateFpk(dstPath); err != nil {
+		return err
 	}
 	return nil
+}
+
+// validateFpk proves the downloaded bytes are an fpk: a gzip stream wrapping
+// a tar whose root carries a manifest entry.
+//
+// Size alone cannot be the gate in either direction. Docker-mode fpks ship
+// no binaries and legitimately land under 10 KiB (astrbot 4.27.4 is 8483
+// bytes, conversun/fnos-apps#284), while a mirror answering 200 with a
+// full-size HTML error page defeats any size floor. Archive structure is
+// the actual contract the installer relies on.
+func validateFpk(path string) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	gz, err := gzip.NewReader(f)
+	if err != nil {
+		return fmt.Errorf("downloaded file is not a valid fpk archive: %w", err)
+	}
+	defer gz.Close()
+
+	tr := tar.NewReader(gz)
+	for {
+		hdr, err := tr.Next()
+		if err == io.EOF {
+			return errors.New("downloaded fpk has no manifest entry — likely corrupted or an error page")
+		}
+		if err != nil {
+			return fmt.Errorf("downloaded fpk is truncated: %w", err)
+		}
+		if filepath.Base(hdr.Name) == "manifest" {
+			return nil
+		}
+	}
 }
 
 func checkTmpSpace(tmpDir string) error {

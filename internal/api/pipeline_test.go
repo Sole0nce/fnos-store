@@ -3,6 +3,10 @@ package api
 import (
 	"context"
 	"errors"
+	"fmt"
+	"net"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -11,6 +15,7 @@ import (
 	"time"
 
 	"fnos-store/internal/config"
+	"fnos-store/internal/core"
 	"fnos-store/internal/platform"
 )
 
@@ -30,6 +35,10 @@ type stubAppCenter struct {
 	setVolCalls    []int
 	setVolErr      error
 	upgradeBlocked bool
+	// daemonInstallDown models the daemon's INSTALL channel being unreachable,
+	// independently of upgradeBlocked — they are separate probes so a change to
+	// one cannot reroute the other onto install-local.
+	daemonInstallDown bool
 	// curVol is the volume the stub reports from DefaultVolume(). A successful
 	// SetDefaultVolume updates it; setVolIgnored models the real fnOS defect
 	// where the setter exits 0 but the value never changes.
@@ -47,6 +56,12 @@ type stubAppCenter struct {
 	installWizardErr error
 	wizard           *platform.AppWizard
 	lastParams       []platform.WizardParam
+
+	startErr     error
+	statusScript []string // per-call Status values; the last entry repeats
+
+	nStart  int32
+	nStatus int32
 }
 
 type stubCheckResult struct {
@@ -69,7 +84,18 @@ func (s *stubAppCenter) List() ([]platform.InstalledApp, error) {
 	return s.listResult, s.listErr
 }
 
-func (s *stubAppCenter) Status(string) (string, error) { return "", nil }
+// Status replays statusScript one entry per call (clamping to the last
+// entry, like Check); an empty script keeps the legacy "", nil answer.
+func (s *stubAppCenter) Status(string) (string, error) {
+	idx := int(atomic.AddInt32(&s.nStatus, 1)) - 1
+	if len(s.statusScript) == 0 {
+		return "", nil
+	}
+	if idx >= len(s.statusScript) {
+		idx = len(s.statusScript) - 1
+	}
+	return s.statusScript[idx], nil
+}
 func (s *stubAppCenter) InstallFpk(string, int) error {
 	atomic.AddInt32(&s.nInstallFpk, 1)
 	return nil
@@ -79,9 +105,12 @@ func (s *stubAppCenter) InstallLocal(string, int, bool) error {
 	atomic.AddInt32(&s.nInstallLocal, 1)
 	return nil
 }
-func (s *stubAppCenter) Uninstall(string) error { return nil }
-func (s *stubAppCenter) Start(string) error     { return nil }
-func (s *stubAppCenter) Stop(string) error      { return nil }
+func (s *stubAppCenter) Uninstall(context.Context, string) error { return nil }
+func (s *stubAppCenter) Start(string) error {
+	atomic.AddInt32(&s.nStart, 1)
+	return s.startErr
+}
+func (s *stubAppCenter) Stop(string) error { return nil }
 func (s *stubAppCenter) DefaultVolume() (int, error) {
 	if s.getVolErr != nil {
 		return 0, s.getVolErr
@@ -112,6 +141,10 @@ func (s *stubAppCenter) UpgradeCapability() platform.UpgradeCapability {
 		return platform.UpgradeCapability{Allowed: false, PlatformVersion: "1.2.0203", Reason: "该 fnOS 版本更新会删除应用数据"}
 	}
 	return platform.UpgradeCapability{Allowed: true, PlatformVersion: "test"}
+}
+
+func (s *stubAppCenter) DaemonInstallAvailable() bool {
+	return !s.daemonInstallDown
 }
 
 func (s *stubAppCenter) AppInstallVolume(string) (int, bool, error) {
@@ -861,4 +894,273 @@ func TestUpdateUsesDaemonUpgradeNotInstallLocal(t *testing.T) {
 	})
 }
 
+// TestChooseInstallRoute locks the channel every operation installs/upgrades
+// through: updates always take the daemon's data-preserving upgrade, fresh
+// installs take the daemon's install channel when reachable (avoiding
+// install-local's code-10237 chown failures, #227/#228), and only a box whose
+// daemon is unreachable falls back to install-local for a fresh install.
+func TestChooseInstallRoute(t *testing.T) {
+	cases := []struct {
+		name     string
+		opName   string
+		daemonUp bool
+		want     installRoute
+	}{
+		{"update uses the daemon upgrade even when the daemon is down", "update", false, routeDaemonUpgrade},
+		{"update uses the daemon upgrade when the daemon is up", "update", true, routeDaemonUpgrade},
+		{"fresh install uses the daemon install when the daemon is up", "install", true, routeDaemonInstall},
+		{"fresh install falls back to install-local only when the daemon is down", "install", false, routeInstallLocal},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := chooseInstallRoute(c.opName, c.daemonUp); got != c.want {
+				t.Errorf("chooseInstallRoute(%q, %v) = %v, want %v", c.opName, c.daemonUp, got, c.want)
+			}
+		})
+	}
+}
+
 var errSimulatedUpgrade = errors.New("simulated upgrade failure")
+
+// TestDockerPullCandidates locks the per-image fallback chain behind the fix
+// for conversun/fnos-apps#267, #266, #257, #248: the selected mirror's shape
+// comes first, every other real mirror follows with the ref re-prefixed by
+// ITS OWN multi-registry capability (strip the old prefix, apply the new one),
+// and the bare direct ref closes the list.
+func TestDockerPullCandidates(t *testing.T) {
+	t.Run("daocloud multi-registry ref fans out across every mirror", func(t *testing.T) {
+		cfg := config.Config{DockerMirror: "daocloud"}
+		got := dockerPullCandidates("m.daocloud.io/docker.io/xream/sub-store:2.36.35", cfg)
+		want := []string{
+			"m.daocloud.io/docker.io/xream/sub-store:2.36.35", // selected, multi-registry: unchanged
+			"docker.1ms.run/xream/sub-store:2.36.35",          // single-registry mirrors strip docker.io/
+			"docker.m.daocloud.io/xream/sub-store:2.36.35",
+			"hub.rat.dev/xream/sub-store:2.36.35",
+			"docker.1panel.live/xream/sub-store:2.36.35",
+			"dockerproxy.net/xream/sub-store:2.36.35",
+			"registry.cyou/xream/sub-store:2.36.35",
+			"docker.io/xream/sub-store:2.36.35", // direct, always last
+		}
+		if len(got) != len(want) {
+			t.Fatalf("len = %d, want %d: %v", len(got), len(want), got)
+		}
+		for i := range want {
+			if got[i] != want[i] {
+				t.Errorf("candidates[%d] = %q, want %q", i, got[i], want[i])
+			}
+		}
+	})
+
+	t.Run("single-registry selection starts with its own normalized shape", func(t *testing.T) {
+		cfg := config.Config{DockerMirror: "docker-1ms"}
+		got := dockerPullCandidates("docker.1ms.run/docker.io/xream/sub-store:2.36.35", cfg)
+		if len(got) == 0 {
+			t.Fatal("no candidates")
+		}
+		if got[0] != "docker.1ms.run/xream/sub-store:2.36.35" {
+			t.Errorf("first candidate = %q, want the selected mirror's normalized ref", got[0])
+		}
+		if got[1] != "m.daocloud.io/docker.io/xream/sub-store:2.36.35" {
+			t.Errorf("second candidate = %q, want daocloud's multi-registry shape", got[1])
+		}
+		if got[len(got)-1] != "docker.io/xream/sub-store:2.36.35" {
+			t.Errorf("last candidate = %q, want the direct ref", got[len(got)-1])
+		}
+		seen := map[string]bool{}
+		for _, c := range got {
+			if seen[c] {
+				t.Errorf("duplicate candidate %q in %v", c, got)
+			}
+			seen[c] = true
+		}
+	})
+}
+
+// TestPullRetryPredicate locks which pull failures advance to the next mirror
+// candidate and which abort the whole chain: registry denials (allowlist,
+// access denied) are per-mirror and must fall through, while local fatal
+// conditions (cancellation, disk full, OOM kill) make every further attempt
+// pointless.
+func TestPullRetryPredicate(t *testing.T) {
+	cases := []struct {
+		name      string
+		output    string
+		err       error
+		wantAbort bool
+	}{
+		{"allowlist denial continues to the next mirror", "denied: 这镜像不在白名单. this image is not in the allowlist.", nil, false},
+		{"pull access denied continues to the next mirror", "Error response from daemon: pull access denied for m.daocloud.io/docker.io/xream/sub-store", nil, false},
+		{"context canceled aborts the chain", "context canceled", nil, true},
+		{"disk full aborts the chain", "write /var/lib/docker/tmp: no space left on device", nil, true},
+		{"oom kill aborts the chain", "signal: killed", nil, true},
+		{"canceled ctx error aborts the chain", "", context.Canceled, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := isPullAbortError(tc.output, tc.err); got != tc.wantAbort {
+				t.Errorf("isPullAbortError(%q, %v) = %v, want %v", tc.output, tc.err, got, tc.wantAbort)
+			}
+		})
+	}
+}
+
+// TestStartFailureRecovery locks the transient-start recovery contract for
+// conversun/fnos-apps#264, #260, #258, #253, #251 and #246. On a busy daemon
+// `appcenter-cli start` returns a transient "code 10500" envelope while the
+// app is still coming up — the attached logs show the apps listening seconds
+// after the store declared the install failed. The start step must therefore
+// give a serviced app a bounded window to prove itself (CLI status OR a TCP
+// dial on its service port) instead of failing the install — while:
+//   - a genuinely dead app still fails, after the window, with the ORIGINAL error;
+//   - a portless app keeps the 1.8.3 tolerance (#226) and never polls;
+//   - a non-envelope (exec-level) error fails immediately, never swallowed.
+func TestStartFailureRecovery(t *testing.T) {
+	const (
+		appName = "msf"
+		port    = 7777
+	)
+
+	// Mirrors the real LinuxAppCenter.run wrapping (appcenter_linux.go:41).
+	cliErr := fmt.Errorf("appcenter-cli start %s: %w: Something wrong with appcenter: code 10500", appName, platform.ErrCLIFailure)
+	errDial := errors.New("dial tcp 127.0.0.1: connect: connection refused")
+
+	cases := []struct {
+		name         string
+		startErr     error
+		servicePort  int
+		statusScript []string
+		dialOK       bool
+
+		wantOK       bool   // startAndConfirm lets the install proceed
+		wantErrEvent bool   // the SSE stream carries step=error
+		wantBodySub  string // substring the SSE body must contain
+		wantNStart   int32
+		wantNStatus  int32
+		wantNDial    int32
+	}{
+		{
+			name:         "transient_10500_recovers",
+			startErr:     cliErr,
+			servicePort:  port,
+			statusScript: []string{"starting", "running"}, // running on the 2nd poll
+			dialOK:       false,                           // the port never answers; status alone proves it
+			wantOK:       true,
+			wantBodySub:  "已确认应用实际在运行",
+			wantNStart:   1,
+			wantNStatus:  2,
+			wantNDial:    1,
+		},
+		{
+			name:         "port_listen_recovers",
+			startErr:     cliErr,
+			servicePort:  port,
+			statusScript: []string{"starting"}, // the control plane never catches up
+			dialOK:       true,                 // but the service port accepts a connection
+			wantOK:       true,
+			wantBodySub:  "已确认应用实际在运行",
+			wantNStart:   1,
+			wantNStatus:  1,
+			wantNDial:    1,
+		},
+		{
+			name:         "dead_app_still_fails",
+			startErr:     cliErr,
+			servicePort:  port,
+			statusScript: []string{"starting"},
+			dialOK:       false,
+			wantOK:       false,
+			wantErrEvent: true,
+			wantBodySub:  "code 10500", // the ORIGINAL start error, not a timeout invention
+			wantNStart:   1,
+			// Probes at t=0,2,...,30 within the 30s window: bounded, then fails.
+			wantNStatus: 16,
+			wantNDial:   16,
+		},
+		{
+			name:        "serviceportless_skips_poll",
+			startErr:    cliErr,
+			servicePort: 0, // #226 tolerance from 1.8.3: a note, no polling at all
+			wantOK:      true,
+			wantBodySub: "无需启动",
+			wantNStart:  1,
+			wantNStatus: 0,
+			wantNDial:   0,
+		},
+		{
+			name:         "non_clifailure_not_swallowed",
+			startErr:     errors.New("appcenter-cli start msf: exit status 1"), // plain exec error
+			servicePort:  port,
+			wantOK:       false,
+			wantErrEvent: true,
+			wantBodySub:  "exit status 1",
+			wantNStart:   1,
+			wantNStatus:  0, // immediate failure: no recovery window for hard errors
+			wantNDial:    0,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			// Fake clock: the injected sleep advances it instantly, so the
+			// whole 30s recovery window replays in microseconds — no real
+			// sleeping, no real sockets.
+			fakeNow := time.Now()
+			var nDial int32
+
+			origNow, origSleep, origDial := startRecoveryNow, startRecoverySleep, startRecoveryDial
+			startRecoveryNow = func() time.Time { return fakeNow }
+			startRecoverySleep = func(ctx context.Context, d time.Duration) error {
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				default:
+				}
+				fakeNow = fakeNow.Add(d)
+				return nil
+			}
+			startRecoveryDial = func(network, addr string, _ time.Duration) (net.Conn, error) {
+				atomic.AddInt32(&nDial, 1)
+				if want := fmt.Sprintf("127.0.0.1:%d", port); network != "tcp" || addr != want {
+					return nil, fmt.Errorf("unexpected dial %s %s, want tcp %s", network, addr, want)
+				}
+				if !tc.dialOK {
+					return nil, errDial
+				}
+				c1, _ := net.Pipe() // hermetic in-memory conn, closed by the helper
+				return c1, nil
+			}
+			t.Cleanup(func() {
+				startRecoveryNow, startRecoverySleep, startRecoveryDial = origNow, origSleep, origDial
+			})
+
+			stub := &stubAppCenter{startErr: tc.startErr, statusScript: tc.statusScript}
+			p := &installPipeline{queue: NewOperationQueue(), ac: stub}
+
+			rec := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodPost, "/install", nil)
+			stream := &sseStream{w: rec, r: req, flusher: rec, appname: appName}
+
+			ok := p.startAndConfirm(context.Background(), stream, core.AppInfo{AppName: appName, ServicePort: tc.servicePort})
+
+			if ok != tc.wantOK {
+				t.Fatalf("startAndConfirm = %v, want %v", ok, tc.wantOK)
+			}
+			body := rec.Body.String()
+			if tc.wantBodySub != "" && !strings.Contains(body, tc.wantBodySub) {
+				t.Errorf("SSE body missing %q:\n%s", tc.wantBodySub, body)
+			}
+			if hasErr := strings.Contains(body, `"step":"error"`); hasErr != tc.wantErrEvent {
+				t.Errorf("error event present = %v, want %v:\n%s", hasErr, tc.wantErrEvent, body)
+			}
+			if got := atomic.LoadInt32(&stub.nStart); got != tc.wantNStart {
+				t.Errorf("Start calls = %d, want %d", got, tc.wantNStart)
+			}
+			if got := atomic.LoadInt32(&stub.nStatus); got != tc.wantNStatus {
+				t.Errorf("Status calls = %d, want %d", got, tc.wantNStatus)
+			}
+			if got := atomic.LoadInt32(&nDial); got != tc.wantNDial {
+				t.Errorf("dial calls = %d, want %d", got, tc.wantNDial)
+			}
+		})
+	}
+}

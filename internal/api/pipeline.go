@@ -587,9 +587,9 @@ func (p *installPipeline) dockerPull(ctx context.Context, stream *sseStream, fpk
 	}
 
 	mirror := os.Getenv("DOCKER_MIRROR")
-	var multiRegistry bool
+	pullCfg := config.Config{DockerMirror: config.DefaultDockerMirror}
 	if p.configMgr != nil {
-		multiRegistry = config.IsDockerMirrorMultiRegistry(p.configMgr.Get().DockerMirror)
+		pullCfg = p.configMgr.Get()
 	}
 
 	images := parseDockerImages(string(data), app, mirror)
@@ -609,8 +609,8 @@ func (p *installPipeline) dockerPull(ctx context.Context, stream *sseStream, fpk
 		}
 		_ = stream.sendProgress(progressPayload{Step: "pulling", Progress: 0, Message: msg})
 
-		pullRef := normalizeImageForPull(composeRef, mirror, multiRegistry)
-		if err := p.pullSingleImage(ctx, stream, pullRef, msg); err != nil {
+		pullRef, err := p.pullImageWithFallback(ctx, stream, dockerPullCandidates(composeRef, pullCfg), msg)
+		if err != nil {
 			return err
 		}
 		if pullRef != composeRef {
@@ -622,16 +622,16 @@ func (p *installPipeline) dockerPull(ctx context.Context, stream *sseStream, fpk
 	return nil
 }
 
-func (p *installPipeline) pullSingleImage(ctx context.Context, stream *sseStream, image, message string) error {
+func (p *installPipeline) pullSingleImage(ctx context.Context, stream *sseStream, image, message string) (string, error) {
 	cmd := exec.CommandContext(ctx, "docker", "pull", image)
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
-		return fmt.Errorf("Docker 镜像拉取失败: %w", err)
+		return "", fmt.Errorf("Docker 镜像拉取失败: %w", err)
 	}
 	cmd.Stderr = cmd.Stdout
 
 	if err := cmd.Start(); err != nil {
-		return fmt.Errorf("Docker 镜像拉取失败: %w", err)
+		return "", fmt.Errorf("Docker 镜像拉取失败: %w", err)
 	}
 
 	var totalLayers, completedLayers int
@@ -664,14 +664,17 @@ func (p *installPipeline) pullSingleImage(ctx context.Context, stream *sseStream
 	}
 
 	if err := cmd.Wait(); err != nil {
+		// Keep the raw wait error alongside the parsed line: the fallback
+		// predicate needs "signal: killed" / "context canceled" even when a
+		// progress line was the last thing scanned.
 		detail := err.Error()
 		if lastErrLine != "" {
-			detail = lastErrLine
+			detail = lastErrLine + ": " + err.Error()
 		}
-		return fmt.Errorf("Docker 镜像拉取失败: %s\n请尝试在 Docker 设置中更换镜像加速源后重试", detail)
+		return detail, fmt.Errorf("Docker 镜像拉取失败: %s", detail)
 	}
 
-	return nil
+	return "", nil
 }
 
 func parseDockerImages(content string, app core.AppInfo, mirror string) []string {
@@ -717,6 +720,32 @@ func normalizeImageForPull(image, mirror string, multiRegistry bool) string {
 	return image
 }
 
+// installRoute names the channel a given operation installs/upgrades through.
+type installRoute int
+
+const (
+	routeDaemonUpgrade installRoute = iota // update -> daemon upgrade (data-preserving)
+	routeDaemonInstall                     // fresh install -> daemon install
+	routeInstallLocal                      // fresh install, daemon down -> install-local
+)
+
+// chooseInstallRoute picks the channel. Updates always take the daemon's
+// data-preserving upgrade (install-local would destroy the app, #189). Fresh
+// installs take the daemon's install channel when it is reachable — the
+// native path fnOS's own App Center uses, which avoids install-local's
+// "code 10237" chown failures (#227, #228) — and only fall back to
+// install-local when the daemon is unreachable, where that is safe because a
+// fresh install has no existing app/data to destroy.
+func chooseInstallRoute(opName string, daemonAvailable bool) installRoute {
+	if opName == "update" {
+		return routeDaemonUpgrade
+	}
+	if daemonAvailable {
+		return routeDaemonInstall
+	}
+	return routeInstallLocal
+}
+
 func (p *installPipeline) runStandard(ctx context.Context, stream *sseStream, opName string, app core.AppInfo, params []platform.WizardParam, refreshFn func(context.Context) error) {
 	// Guard first: refuse before downloading, so an affected system never
 	// reaches the uninstall-then-failed-reinstall path.
@@ -758,17 +787,31 @@ func (p *installPipeline) runStandard(ctx context.Context, stream *sseStream, op
 	}
 
 	// Updates go through the daemon's own upgrade channel, which preserves
-	// @appdata and can roll back. install-local (used for fresh installs) is
-	// uninstall-then-reinstall and destroys the app when the reinstall fails
-	// — conversun/fnos-apps#189. A failure here must NEVER fall back to it.
-	// Fresh installs also go through the daemon when it is reachable, so an
-	// app that declares an install wizard can actually receive the user's
-	// answers. install-local has no way to pass them.
-	installStep := func() error { return p.installFpk(fpkPath, volume) }
-	if opName == "update" {
+	// @appdata and can roll back. install-local is uninstall-then-reinstall and
+	// destroys the app when the reinstall fails — conversun/fnos-apps#189. A
+	// failure there must NEVER fall back to it.
+	//
+	// Fresh installs ALSO go through the daemon by default now, not only when a
+	// wizard supplies params. install-local is a CLI shortcut whose chown step
+	// fails installs outright with the opaque "code 10237" on some builds
+	// (conversun/fnos-apps#227, #228), while the daemon's install/task is the
+	// native path fnOS's own App Center uses and does not hit it. Routing every
+	// fresh install through it — with an empty param set when the app declares no
+	// wizard — keeps the two mechanisms consistent. install-local survives only
+	// as the fallback for a box whose daemon is unreachable, where it is safe
+	// because a fresh install has no existing app/data to destroy.
+	//
+	// The fallback is gated on the INSTALL probe, not the upgrade one: they are
+	// different routes, and letting the update probe decide this would reroute
+	// installs onto install-local because of a change that never touched installs.
+	var installStep func() error
+	switch chooseInstallRoute(opName, p.ac.DaemonInstallAvailable()) {
+	case routeDaemonUpgrade:
 		installStep = func() error { return p.upgradeFpk(ctx, fpkPath) }
-	} else if len(params) > 0 {
+	case routeDaemonInstall:
 		installStep = func() error { return p.installFpkWithWizard(ctx, fpkPath, volume, params) }
+	default: // routeInstallLocal
+		installStep = func() error { return p.installFpk(fpkPath, volume) }
 	}
 
 	if err := runWithVirtualProgress(ctx, stream, "installing", "正在安装...", installStep); err != nil {
@@ -799,10 +842,7 @@ func (p *installPipeline) runStandard(ctx context.Context, stream *sseStream, op
 	// "[Info]Application [x] is already started." — which the CLI reports as a
 	// failure, turning a successful upgrade into a user-visible error.
 	if opName != "update" {
-		if err := runWithVirtualProgress(ctx, stream, "starting", "正在启动...", func() error {
-			return p.startApp(app.AppName)
-		}); err != nil {
-			_ = stream.sendError(err.Error())
+		if !p.startAndConfirm(ctx, stream, app) {
 			return
 		}
 	}
@@ -843,18 +883,9 @@ func (p *installPipeline) runSelfUpdate(ctx context.Context, stream *sseStream, 
 		return
 	}
 
-	if err := p.setDefaultVolume(volume); err != nil {
-		_ = stream.sendError(fmt.Sprintf("无法锁定安装目标卷 vol%d，已中止商店更新以保护现有数据: %v", volume, err))
-		return
-	}
-
-	dir, err := p.extractFpk(fpkPath)
-	if err != nil {
-		_ = stream.sendError(err.Error())
-		return
-	}
-	// dir cleanup is conditional on the InstallLocal outcome below.
-
+	// Announce BEFORE submitting: the daemon kills this process partway through
+	// the upgrade, so this is the last thing the client is guaranteed to see.
+	// The frontend's pollForRestart takes over from here.
 	_ = stream.sendProgress(progressPayload{Step: "self_update", Message: "商店正在重启..."})
 
 	// Wait for the SSE bytes to actually reach the client. See the comment on
@@ -864,27 +895,30 @@ func (p *installPipeline) runSelfUpdate(ctx context.Context, stream *sseStream, 
 	case <-ctx.Done():
 	}
 
-	// Detached: appcenter-cli runs in a new session so it survives this
-	// process being killed during install-local's uninstall phase.
+	// Update through the daemon channel, exactly like every other update.
 	//
-	// Still routed through WithCLI even though it returns immediately: the
-	// scheduler's registry refresh calls List() through the same lock, and the
-	// launch must not interleave with it. cmd.Start() does not wait for the
-	// child, so holding the lock here costs nothing.
+	// This used to fork a detached `install-local` — the uninstall-then-reinstall
+	// path this codebase forbids for app updates (#189) — aimed at the store
+	// itself, where a failed reinstall leaves the user with no store to reinstall
+	// it from. Worse, it did that AFTER requireSafeUpgrade had already confirmed
+	// the safe channel was available.
+	//
+	// Measured on 1.2.0505: the daemon upgrades the store in place, keeps
+	// @appdata byte-identical, and pins the volume from its own record — so the
+	// setDefaultVolume call this path used to need (a global fnOS mutation just
+	// to aim install-local) is gone too. Being a separate process, the daemon
+	// finishes the task after it kills us; waitTask dies with this process, the
+	// operation does not.
 	if err := p.queue.WithCLI(func() error {
-		return p.ac.InstallLocal(dir, volume, true)
+		return p.ac.UpgradeFpk(ctx, fpkPath, nil)
 	}); err != nil {
-		// The fork itself failed - the child never started, so it's safe
-		// (and necessary) to clean up the extracted directory here.
-		log.Printf("runSelfUpdate: InstallLocal launch failed: %v", err)
-		_ = stream.sendError(fmt.Sprintf("商店更新启动失败: %v", err))
-		_ = os.RemoveAll(dir)
+		log.Printf("runSelfUpdate: daemon upgrade failed: %v", err)
+		_ = stream.sendError(fmt.Sprintf("商店更新失败: %v", err))
 		return
 	}
-	// Success path: dir is intentionally NOT cleaned up - the detached child
-	// reads it asynchronously after cmd.Start() returns, and fnOS will kill
-	// this process before any deferred cleanup could run. /tmp is wiped on
-	// reboot.
+	// Reaching here means the daemon completed without killing us — uncommon but
+	// harmless; the frontend is already polling for a restart either way.
+	_ = stream.sendProgress(progressPayload{Step: "done", NewVersion: app.FpkVersion, Message: "操作完成"})
 }
 
 // downloadFpkQuiet fetches an fpk without an SSE stream, for callers that are
@@ -928,13 +962,27 @@ func (p *installPipeline) downloadFpkQuiet(ctx context.Context, app core.AppInfo
 // to the shared downloader for this one caller would risk serving a stale
 // package to every install path.
 //
-// The file is removed after reading so a wizard peek never leaves a package
-// behind for an install the user then cancels.
+// Both the store's local copy and the daemon's staged copy are removed after
+// reading, so a wizard peek the user then cancels leaves nothing behind.
 func (p *installPipeline) fetchWizard(ctx context.Context, app core.AppInfo) (*platform.AppWizard, error) {
 	fpkPath, err := p.downloadFpkQuiet(ctx, app)
 	if err != nil {
 		return nil, err
 	}
 	defer os.Remove(fpkPath)
-	return p.ac.FetchWizard(ctx, fpkPath)
+
+	// Staging drives the daemon exactly as an install does, so it takes the same
+	// lock. Without this a wizard preview can stage concurrently with a live
+	// install or upgrade, even though the rest of the pipeline is written on the
+	// assumption that daemon operations are serialized. The download above stays
+	// OUTSIDE the lock — it is slow, network-bound and touches no daemon state.
+	var wizard *platform.AppWizard
+	if err := p.queue.WithCLI(func() error {
+		var e error
+		wizard, e = p.ac.FetchWizard(ctx, fpkPath)
+		return e
+	}); err != nil {
+		return nil, err
+	}
+	return wizard, nil
 }

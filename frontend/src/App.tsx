@@ -888,7 +888,8 @@ const App: React.FC = () => {
                                 </div>
                               )}
                              </div>
-                              <div className="p-4 border-t border-border space-y-1 shrink-0">
+                              {/* Safe-area bottom keeps 设置 above the Android gesture/nav bar (issue #7) */}
+                              <div className="p-4 pb-[max(1rem,env(safe-area-inset-bottom))] border-t border-border space-y-1 shrink-0">
                                  <Button
                                    variant="ghost"
                                    className="w-full justify-start h-10 px-3 shadow-none text-muted-foreground hover:text-foreground"
@@ -1168,6 +1169,7 @@ const App: React.FC = () => {
         onUpdate={handleUpdate}
         onIgnoreUpdate={handleIgnoreUpdate}
         onUnignoreUpdate={handleUnignoreUpdate}
+        onUninstall={handleUninstall}
         operation={detailApp ? appOperations.get(detailApp.appname) : undefined}
       />
 

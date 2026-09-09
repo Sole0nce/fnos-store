@@ -1,5 +1,7 @@
 import React from 'react';
 import type { AppInfo, AppOperation } from '../api/client';
+import { availableVersionLabel, installedVersionLabel } from '../api/client';
+import { apiUrl } from '../api/base';
 import {
   Dialog,
   DialogContent,
@@ -24,6 +26,7 @@ import {
   BellOff,
   Bell,
   Loader2,
+  Trash2,
 } from 'lucide-react';
 
 interface AppDetailDialogProps {
@@ -34,6 +37,7 @@ interface AppDetailDialogProps {
   onUpdate: (app: AppInfo) => void;
   onIgnoreUpdate?: (app: AppInfo) => void;
   onUnignoreUpdate?: (app: AppInfo) => void;
+  onUninstall?: (app: AppInfo) => void;
   operation?: AppOperation;
 }
 
@@ -47,7 +51,7 @@ const DetailRow: React.FC<{ icon: React.ElementType; label: string; children: Re
   </div>
 );
 
-const AppDetailDialog: React.FC<AppDetailDialogProps> = ({ app, open, onOpenChange, onInstall, onUpdate, onIgnoreUpdate, onUnignoreUpdate, operation }) => {
+const AppDetailDialog: React.FC<AppDetailDialogProps> = ({ app, open, onOpenChange, onInstall, onUpdate, onIgnoreUpdate, onUnignoreUpdate, onUninstall, operation }) => {
   if (!app) return null;
 
   const isInstalled = app.installed;
@@ -139,11 +143,11 @@ const AppDetailDialog: React.FC<AppDetailDialogProps> = ({ app, open, onOpenChan
         <div className="space-y-0">
           <DetailRow icon={Tag} label="版本">
             <div className="flex items-center gap-2 flex-wrap">
-              <span>{isInstalled ? `v${app.installed_version}` : `v${app.latest_version}`}</span>
+              <span>{isInstalled ? `v${installedVersionLabel(app)}` : `v${app.latest_version}`}</span>
               {canUpdate && (
                 <>
                   <span className="text-muted-foreground">→</span>
-                  <span className="text-primary font-medium">v{app.available_version || app.latest_version}</span>
+                  <span className="text-primary font-medium">v{availableVersionLabel(app)}</span>
                 </>
               )}
               {!isInstalled && (
@@ -204,11 +208,24 @@ const AppDetailDialog: React.FC<AppDetailDialogProps> = ({ app, open, onOpenChan
             asChild
             className="rounded-full px-4"
           >
-            <a href={`/api/apps/${app.appname}/download`} download>
+            <a href={apiUrl(`/api/apps/${app.appname}/download`)} download>
               <Download className="mr-1.5 h-3.5 w-3.5" />
               下载 fpk
             </a>
           </Button>
+          {isInstalled && onUninstall && (
+            <Button
+              size="sm"
+              variant="ghost"
+              onClick={() => { onOpenChange(false); onUninstall(app); }}
+              disabled={!!operation}
+              aria-label={`卸载 ${app.display_name}`}
+              className="rounded-full px-4 text-muted-foreground hover:text-destructive hover:bg-destructive/10"
+            >
+              <Trash2 className="mr-1.5 h-3.5 w-3.5" />
+              卸载
+            </Button>
+          )}
           {app.update_ignored && onUnignoreUpdate && (
             <Button
               size="sm"

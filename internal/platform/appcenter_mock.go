@@ -81,7 +81,7 @@ func (m *MockAppCenter) InstallLocal(dir string, volume int, detach bool) error 
 	return err
 }
 
-func (m *MockAppCenter) Uninstall(appname string) error {
+func (m *MockAppCenter) Uninstall(_ context.Context, appname string) error {
 	_, err := m.run("uninstall", appname)
 	return err
 }
@@ -134,4 +134,11 @@ func (m *MockAppCenter) InstallFpkWithWizard(_ context.Context, fpkPath string, 
 
 func (m *MockAppCenter) AppInstallVolume(string) (int, bool, error) {
 	return 1, true, nil
+}
+
+// DaemonInstallAvailable is always true in the dev mock: there is no daemon on
+// macOS, and the mock's install path is not destructive, so there is nothing
+// for the fallback to protect against.
+func (m *MockAppCenter) DaemonInstallAvailable() bool {
+	return true
 }

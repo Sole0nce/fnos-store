@@ -40,8 +40,8 @@ type AppCenter interface {
 	// survives the caller being killed (used for self-update).
 	InstallLocal(dir string, volume int, detach bool) error
 
-	// Uninstall removes an installed app.
-	Uninstall(appname string) error
+	// Uninstall removes an installed app, preserving the app's user data.
+	Uninstall(ctx context.Context, appname string) error
 
 	// Start starts an installed app.
 	Start(appname string) error
@@ -71,6 +71,13 @@ type AppCenter interface {
 	// installed app without destroying it. Some builds cannot — see
 	// upgrade.go.
 	UpgradeCapability() UpgradeCapability
+
+	// DaemonInstallAvailable reports whether the daemon's INSTALL channel is
+	// reachable, deciding whether a FRESH install goes through the daemon or
+	// falls back to install-local. Kept separate from UpgradeCapability so a
+	// change to the update probe cannot silently reroute installs onto the
+	// destructive path.
+	DaemonInstallAvailable() bool
 
 	// UpgradeFpk upgrades an ALREADY-INSTALLED app in place, preserving its
 	// data. This is deliberately separate from InstallFpk: InstallFpk goes

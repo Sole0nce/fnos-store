@@ -3,6 +3,8 @@
 package platform
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -130,9 +132,37 @@ func (a *LinuxAppCenter) extractFpk(fpkPath string) (string, error) {
 	return dir, nil
 }
 
-func (a *LinuxAppCenter) Uninstall(appname string) error {
-	_, err := a.run("uninstall", appname)
-	return err
+// Uninstall removes an app through the app-center daemon's uninstall task
+// channel, which is the only reliable path: `appcenter-cli uninstall`'s
+// pre-flight GET /rpc/v1/uninstall/info hits a daemon that only serves POST,
+// so the CLI aborts 100% of the time on fnOS 1.2.0203 (conversun/fnos-apps#265).
+//
+// Fallback rules, in order of how much we know:
+//   - A daemon business error (code != 0) is final: the daemon refused, so the
+//     CLI cannot do better.
+//   - A dial failure proves the request never left this process, so the legacy
+//     CLI is a safe last resort.
+//   - ANY other transport failure is ambiguous — the daemon may already be
+//     uninstalling. Running the CLI then issues a SECOND uninstall, and the CLI
+//     path does not pin wizard_delete_data=false the way submitUninstall does,
+//     so the retry can take the app's @appdata with it. Refuse instead.
+func (a *LinuxAppCenter) Uninstall(ctx context.Context, appname string) error {
+	taskID, err := a.submitUninstall(ctx, appname)
+	if err != nil {
+		var de *DaemonError
+		if errors.As(err, &de) {
+			return fmt.Errorf("卸载失败: %w", err)
+		}
+		if !errors.Is(err, ErrDaemonUnreachable) {
+			return fmt.Errorf("%w：卸载 %s 的请求可能已经送达 app center（%v）。请勿重复卸载，先在应用中心确认应用当前状态",
+				ErrTaskOutcomeUnknown, appname, err)
+		}
+		if _, cliErr := a.run("uninstall", appname); cliErr != nil {
+			return fmt.Errorf("%w（daemon 通道也不可用: %v）", cliErr, err)
+		}
+		return nil
+	}
+	return a.waitTask(ctx, taskID, "卸载")
 }
 
 func (a *LinuxAppCenter) Start(appname string) error {
@@ -228,27 +258,44 @@ func (a *LinuxAppCenter) ListVolumes() ([]VolumeInfo, error) {
 	return volumes, nil
 }
 
-// AppInstallVolume resolves the volume an app currently lives on by reading its
-// /var/apps/<app>/target symlink (-> /volN/@appcenter/<app>) and matching the
-// resolved path against the mounted volumes. This is the CLI-independent source
-// of truth used to pin an update to the app's existing volume instead of a
-// re-resolved global default, which would relocate the app and orphan its data.
-// found is false when the app is not installed or its layout cannot be mapped
-// to a known volume.
+// AppInstallVolume resolves the volume an app currently lives on by probing
+// the app's symlinks under /var/apps/<app> in order: target, var, then meta,
+// matching each resolved path against the mounted volumes. This is the
+// CLI-independent source of truth used to pin an update to the app's existing
+// volume instead of a re-resolved global default, which would relocate the
+// app and orphan its data. found is false when the app is not installed or
+// its layout cannot be mapped to a known volume.
 func (a *LinuxAppCenter) AppInstallVolume(appname string) (int, bool, error) {
 	volumes, err := a.ListVolumes()
 	if err != nil {
 		return 0, false, err
 	}
-	// Prefer the binary target; fall back to the runtime data dir.
-	for _, sub := range []string{"target", "var"} {
-		resolved, err := filepath.EvalSymlinks(filepath.Join("/var/apps", appname, sub))
+	idx, found := appInstallVolume(filepath.Join("/var/apps", appname), volumes)
+	return idx, found, nil
+}
+
+// appInstallVolume probes the app's symlinks in order: target
+// (-> /volN/@appcenter/<app>), var (-> /volN/@appdata/<app>), then meta
+// (-> /volN/@appmeta/<app>), and returns the volume of the first that
+// resolves onto a mounted volume.
+//
+// target stays authoritative for normal apps. meta is the rescue for
+// root-type apps (install_type = root, e.g. nvidia-driver): fnOS installs
+// those to the SYSTEM filesystem (/usr/local/apps/...), so target and var
+// resolve off-volume, and only meta — fnOS's own per-app volume association —
+// still points onto a storage volume. Measured on fnOS 1.2.0203 across 60
+// installed apps: 60/60 have a meta symlink, 60/60 metas resolve onto a
+// /volN, and meta never contradicts an on-volume target
+// (conversun/fnos-apps#254).
+func appInstallVolume(appDir string, volumes []VolumeInfo) (int, bool) {
+	for _, sub := range []string{"target", "var", "meta"} {
+		resolved, err := filepath.EvalSymlinks(filepath.Join(appDir, sub))
 		if err != nil {
 			continue
 		}
 		if idx, ok := volumeIndexForPath(resolved, volumes); ok {
-			return idx, true, nil
+			return idx, true
 		}
 	}
-	return 0, false, nil
+	return 0, false
 }
