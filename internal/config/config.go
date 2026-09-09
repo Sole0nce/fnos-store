@@ -11,7 +11,7 @@ const (
 	DefaultCheckIntervalHours = 6
 	DefaultDataDir            = "/var/apps/fnos-apps-store/var"
 	DefaultMirror             = "gh-proxy"
-	DefaultDockerMirror       = "daocloud"
+	DefaultDockerMirror       = "direct"
 )
 
 type GitHubMirror struct {
