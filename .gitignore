@@ -6,3 +6,4 @@ var/
 store-server-linux-*
 server
 .omo/
+_tools/
