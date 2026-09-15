@@ -28,7 +28,7 @@ func (s *Server) handleListApps(w http.ResponseWriter, r *http.Request) {
 
 		releaseURL := ""
 		if app.ReleaseTag != "" {
-			releaseURL = fmt.Sprintf("https://github.com/conversun/fnos-apps/releases/tag/%s", app.ReleaseTag)
+			releaseURL = fmt.Sprintf("https://github.com/Sole0nce/fnos-apps/releases/tag/%s", app.ReleaseTag)
 		}
 
 		hasUpdate := app.Status == core.AppStatusUpdateAvailable
