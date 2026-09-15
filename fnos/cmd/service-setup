@@ -7,7 +7,7 @@ APP_DIR="${TRIM_APPDEST}"
 APP_DATA_DIR="${TRIM_PKGVAR}"
 
 # Allow our custom distributor in addition to upstream conversun
-export ALLOWED_DISTRIBUTORS="conversun,soleo"
+export ALLOWED_DISTRIBUTORS="conversun,soleo,Sole0nce"
 
 SERVICE_COMMAND="$APP_DIR/store-server"
 SVC_BACKGROUND=y
